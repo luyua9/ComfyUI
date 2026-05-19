@@ -10,7 +10,12 @@ import folder_paths
 import execution
 import threading
 from comfy_execution.jobs import JobStatus, get_job, get_all_jobs
-from comfy_execution.metadata import PromptMetadata, build_prompt_metadata, merge_prompt_metadata
+from comfy_execution.metadata import (
+    PromptMetadata,
+    build_prompt_metadata,
+    merge_prompt_metadata,
+    resolve_progress_text_sid,
+)
 import uuid
 import urllib
 import json
@@ -254,7 +259,7 @@ class PromptServer():
         self.last_node_id = None
         self.client_id = None
 
-        self.prompt_metadata: dict[str, PromptMetadata] = {}
+        self.prompt_metadata: dict[str, list[PromptMetadata]] = {}
         self._prompt_metadata_lock = threading.Lock()
 
         self.on_prompt_handlers = []
@@ -1234,20 +1239,30 @@ class PromptServer():
         the execution thread and can be merged onto outbound WebSocket payloads
         in ``send_sync`` without coupling the execution layer to workflow-level
         concepts.
+
+        Stacked per ``prompt_id`` so a client retrying or colliding with the
+        same id doesn't have its metadata clobbered or, worse, removed by the
+        other prompt's unregister.
         """
         meta = build_prompt_metadata(extra_data)
         if not meta:
             return
         with self._prompt_metadata_lock:
-            self.prompt_metadata[prompt_id] = meta
+            self.prompt_metadata.setdefault(prompt_id, []).append(meta)
 
     def unregister_prompt_metadata(self, prompt_id: str) -> None:
         with self._prompt_metadata_lock:
-            self.prompt_metadata.pop(prompt_id, None)
+            stack = self.prompt_metadata.get(prompt_id)
+            if not stack:
+                return
+            stack.pop()
+            if not stack:
+                self.prompt_metadata.pop(prompt_id, None)
 
     def get_prompt_metadata(self, prompt_id: str) -> PromptMetadata:
         with self._prompt_metadata_lock:
-            return dict(self.prompt_metadata.get(prompt_id, {}))
+            stack = self.prompt_metadata.get(prompt_id)
+            return dict(stack[-1]) if stack else {}
 
     def send_sync(self, event, data, sid=None):
         data = merge_prompt_metadata(self.prompt_metadata, self._prompt_metadata_lock, data)
@@ -1319,7 +1334,10 @@ class PromptServer():
         return json_data
 
     def send_progress_text(
-        self, text: Union[bytes, bytearray, str], node_id: str, sid=None
+        self,
+        text: Union[bytes, bytearray, str],
+        node_id: str,
+        sid=None,
     ):
         if isinstance(text, str):
             text = text.encode("utf-8")
@@ -1327,5 +1345,12 @@ class PromptServer():
 
         # Pack the node_id length as a 4-byte unsigned integer, followed by the node_id bytes
         message = struct.pack(">I", len(node_id_bytes)) + node_id_bytes + text
+
+        # Default routing to the active prompt's client so other clients don't
+        # silently receive untagged text frames. The binary wire format does
+        # not yet carry prompt_id/workflow_id, so cross-tab filtering inside a
+        # single client still depends on a follow-up wire-format change with a
+        # feature flag.
+        sid = resolve_progress_text_sid(sid, self.client_id)
 
         self.send_sync(BinaryEventTypes.TEXT, message, sid)

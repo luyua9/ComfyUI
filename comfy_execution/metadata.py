@@ -30,6 +30,21 @@ def build_prompt_metadata(extra_data: Optional[dict]) -> PromptMetadata:
     return meta
 
 
+def resolve_progress_text_sid(sid, default_sid):
+    """Pick the recipient for a ``send_progress_text`` binary frame.
+
+    Returns ``default_sid`` (typically ``PromptServer.client_id`` — the client
+    that submitted the active prompt) when the caller didn't pin a specific
+    socket. This narrows the audience for text status updates from "every
+    connected client" to "the client running this prompt", matching the
+    cross-client isolation other execution events already have.
+
+    Splitting this out keeps the unit test independent of the full ``server``
+    import chain.
+    """
+    return default_sid if sid is None else sid
+
+
 def merge_prompt_metadata(
     registry: dict,
     lock: threading.Lock,
@@ -38,6 +53,10 @@ def merge_prompt_metadata(
     """Return ``data`` with the registered metadata for its ``prompt_id`` merged
     top-level. The event payload wins on conflict, and non-dict payloads (e.g.
     the binary preview tuple) pass through untouched.
+
+    The registry is a stack per ``prompt_id`` (``dict[str, list[PromptMetadata]]``)
+    so duplicate submissions of the same ``prompt_id`` don't clobber each
+    other's metadata; the most recently registered entry wins.
     """
     if not isinstance(data, dict):
         return data
@@ -45,7 +64,8 @@ def merge_prompt_metadata(
     if not prompt_id:
         return data
     with lock:
-        meta = registry.get(prompt_id)
+        stack = registry.get(prompt_id)
+        meta = stack[-1] if stack else None
     if not meta:
         return data
     return {**meta, **data}
