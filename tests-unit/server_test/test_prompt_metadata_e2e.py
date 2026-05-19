@@ -11,7 +11,6 @@ shape and the ``prompt_id`` collision invariants without needing a browser.
 import asyncio
 import os
 import sys
-import threading
 
 import pytest
 
