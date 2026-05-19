@@ -1200,10 +1200,10 @@ class SaveImageAdvanced(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images, filename_prefix: str, image_format: dict) -> IO.NodeOutput:
-        file_format = image_format["image_format"]
-        bit_depth = image_format["bit_depth"]
-        colorspace = image_format.get("colorspace", "sRGB")
+    def execute(cls, images, filename_prefix: str, format: dict) -> IO.NodeOutput:
+        file_format = format["format"]
+        bit_depth = format["bit_depth"]
+        colorspace = format.get("input_color_space", "sRGB")
 
         output_dir = folder_paths.get_output_directory()
         full_output_folder, filename, counter, subfolder, filename_prefix = (
