@@ -8,7 +8,9 @@ import time
 import nodes
 import folder_paths
 import execution
+import threading
 from comfy_execution.jobs import JobStatus, get_job, get_all_jobs
+from comfy_execution.metadata import PromptMetadata, build_prompt_metadata, merge_prompt_metadata
 import uuid
 import urllib
 import json
@@ -252,6 +254,9 @@ class PromptServer():
         self.last_node_id = None
         self.client_id = None
 
+        self.prompt_metadata: dict[str, PromptMetadata] = {}
+        self._prompt_metadata_lock = threading.Lock()
+
         self.on_prompt_handlers = []
 
         @routes.get('/ws')
@@ -275,7 +280,12 @@ class PromptServer():
                 await self.send("status", {"status": self.get_queue_info(), "sid": sid}, sid)
                 # On reconnect if we are the currently executing client send the current node
                 if self.client_id == sid and self.last_node_id is not None:
-                    await self.send("executing", { "node": self.last_node_id }, sid)
+                    last_prompt_id = getattr(self, "last_prompt_id", None)
+                    payload: dict = {"node": self.last_node_id}
+                    if last_prompt_id:
+                        payload["prompt_id"] = last_prompt_id
+                        payload.update(self.get_prompt_metadata(last_prompt_id))
+                    await self.send("executing", payload, sid)
 
                 # Flag to track if we've received the first message
                 first_message = True
@@ -955,6 +965,7 @@ class PromptServer():
                         if sensitive_val in extra_data:
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
                     extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
+                    self.register_prompt_metadata(prompt_id, extra_data)
                     self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
                     return web.json_response(response)
@@ -1216,7 +1227,30 @@ class PromptServer():
         elif sid in self.sockets:
             await send_socket_catch_exception(self.sockets[sid].send_json, message)
 
+    def register_prompt_metadata(self, prompt_id: str, extra_data: dict) -> None:
+        """Capture per-prompt metadata at submission time.
+
+        Stored on the server (not the executor) so it survives independent of
+        the execution thread and can be merged onto outbound WebSocket payloads
+        in ``send_sync`` without coupling the execution layer to workflow-level
+        concepts.
+        """
+        meta = build_prompt_metadata(extra_data)
+        if not meta:
+            return
+        with self._prompt_metadata_lock:
+            self.prompt_metadata[prompt_id] = meta
+
+    def unregister_prompt_metadata(self, prompt_id: str) -> None:
+        with self._prompt_metadata_lock:
+            self.prompt_metadata.pop(prompt_id, None)
+
+    def get_prompt_metadata(self, prompt_id: str) -> PromptMetadata:
+        with self._prompt_metadata_lock:
+            return dict(self.prompt_metadata.get(prompt_id, {}))
+
     def send_sync(self, event, data, sid=None):
+        data = merge_prompt_metadata(self.prompt_metadata, self._prompt_metadata_lock, data)
         self.loop.call_soon_threadsafe(
             self.messages.put_nowait, (event, data, sid))
 

@@ -159,10 +159,18 @@ class WebUIProgressHandler(ProgressHandler):
     def set_registry(self, registry: "ProgressRegistry"):
         self.registry = registry
 
+    def _lookup_workflow_id(self, prompt_id: str) -> Optional[str]:
+        get_meta = getattr(self.server_instance, "get_prompt_metadata", None)
+        if get_meta is None:
+            return None
+        return get_meta(prompt_id).get("workflow_id")
+
     def _send_progress_state(self, prompt_id: str, nodes: Dict[str, NodeProgressState]):
         """Send the current progress state to the client"""
         if self.server_instance is None:
             return
+
+        workflow_id = self._lookup_workflow_id(prompt_id)
 
         # Only send info for non-pending nodes
         active_nodes = {
@@ -172,6 +180,7 @@ class WebUIProgressHandler(ProgressHandler):
                 "state": state["state"].value,
                 "node_id": node_id,
                 "prompt_id": prompt_id,
+                "workflow_id": workflow_id,
                 "display_node_id": self.registry.dynprompt.get_display_node_id(node_id),
                 "parent_node_id": self.registry.dynprompt.get_parent_node_id(node_id),
                 "real_node_id": self.registry.dynprompt.get_real_node_id(node_id),
@@ -181,7 +190,10 @@ class WebUIProgressHandler(ProgressHandler):
         }
 
         # Send a combined progress_state message with all node states
-        # Include client_id to ensure message is only sent to the initiating client
+        # Include client_id to ensure message is only sent to the initiating client.
+        # The outer ``workflow_id`` is merged in by ``PromptServer.send_sync`` via
+        # the per-prompt metadata registry; the nested copy on each node entry
+        # mirrors the wire shape consumed by the frontend.
         self.server_instance.send_sync(
             "progress_state", {"prompt_id": prompt_id, "nodes": active_nodes}, self.server_instance.client_id
         )
@@ -215,6 +227,7 @@ class WebUIProgressHandler(ProgressHandler):
                 metadata = {
                     "node_id": node_id,
                     "prompt_id": prompt_id,
+                    "workflow_id": self._lookup_workflow_id(prompt_id),
                     "display_node_id": self.registry.dynprompt.get_display_node_id(
                         node_id
                     ),
