@@ -11,6 +11,7 @@ import execution
 import threading
 from comfy_execution.jobs import JobStatus, get_job, get_all_jobs
 from comfy_execution.metadata import (
+    PROMPT_METADATA_TOKEN_KEY,
     PromptMetadata,
     build_prompt_metadata,
     merge_prompt_metadata,
@@ -259,8 +260,14 @@ class PromptServer():
         self.last_node_id = None
         self.client_id = None
 
-        self.prompt_metadata: dict[str, list[PromptMetadata]] = {}
+        # Keyed by an internal monotonic token rather than by ``prompt_id``
+        # because clients can supply the same ``prompt_id`` on retry/dedupe.
+        self.prompt_metadata: dict[int, PromptMetadata] = {}
         self._prompt_metadata_lock = threading.Lock()
+        self._prompt_metadata_counter = 0
+        # Set by ``main.py``'s queue worker for the duration of one prompt's
+        # execution; read by ``send_sync`` to merge the right metadata.
+        self.active_prompt_metadata_token: Optional[int] = None
 
         self.on_prompt_handlers = []
 
@@ -289,7 +296,7 @@ class PromptServer():
                     payload: dict = {"node": self.last_node_id}
                     if last_prompt_id:
                         payload["prompt_id"] = last_prompt_id
-                        payload.update(self.get_prompt_metadata(last_prompt_id))
+                        payload.update(self.get_active_prompt_metadata())
                     await self.send("executing", payload, sid)
 
                 # Flag to track if we've received the first message
@@ -970,7 +977,9 @@ class PromptServer():
                         if sensitive_val in extra_data:
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
                     extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
-                    self.register_prompt_metadata(prompt_id, extra_data)
+                    token = self.register_prompt_metadata(extra_data)
+                    if token is not None:
+                        extra_data[PROMPT_METADATA_TOKEN_KEY] = token
                     self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
                     return web.json_response(response)
@@ -1232,40 +1241,50 @@ class PromptServer():
         elif sid in self.sockets:
             await send_socket_catch_exception(self.sockets[sid].send_json, message)
 
-    def register_prompt_metadata(self, prompt_id: str, extra_data: dict) -> None:
-        """Capture per-prompt metadata at submission time.
+    def register_prompt_metadata(self, extra_data: dict) -> Optional[int]:
+        """Capture per-prompt metadata at submission time and return a token
+        identifying this registration.
 
-        Stored on the server (not the executor) so it survives independent of
-        the execution thread and can be merged onto outbound WebSocket payloads
-        in ``send_sync`` without coupling the execution layer to workflow-level
-        concepts.
-
-        Stacked per ``prompt_id`` so a client retrying or colliding with the
-        same id doesn't have its metadata clobbered or, worse, removed by the
-        other prompt's unregister.
+        Returns ``None`` when there is no recognized metadata, signalling that
+        no token needs to be threaded through the queue. Otherwise the token
+        must be stored on the queue item (typically via
+        :data:`PROMPT_METADATA_TOKEN_KEY` in ``extra_data``) and pinned on the
+        server as ``active_prompt_metadata_token`` while the prompt runs, so
+        the merge in ``send_sync`` picks up this prompt's metadata even when
+        another prompt is registered under the same ``prompt_id``.
         """
         meta = build_prompt_metadata(extra_data)
         if not meta:
+            return None
+        with self._prompt_metadata_lock:
+            self._prompt_metadata_counter += 1
+            token = self._prompt_metadata_counter
+            self.prompt_metadata[token] = meta
+        return token
+
+    def unregister_prompt_metadata(self, token: Optional[int]) -> None:
+        if token is None:
             return
         with self._prompt_metadata_lock:
-            self.prompt_metadata.setdefault(prompt_id, []).append(meta)
+            self.prompt_metadata.pop(token, None)
 
-    def unregister_prompt_metadata(self, prompt_id: str) -> None:
+    def get_prompt_metadata_by_token(self, token: Optional[int]) -> PromptMetadata:
+        if token is None:
+            return {}
         with self._prompt_metadata_lock:
-            stack = self.prompt_metadata.get(prompt_id)
-            if not stack:
-                return
-            stack.pop()
-            if not stack:
-                self.prompt_metadata.pop(prompt_id, None)
+            return dict(self.prompt_metadata.get(token, {}))
 
-    def get_prompt_metadata(self, prompt_id: str) -> PromptMetadata:
-        with self._prompt_metadata_lock:
-            stack = self.prompt_metadata.get(prompt_id)
-            return dict(stack[-1]) if stack else {}
+    def get_active_prompt_metadata(self) -> PromptMetadata:
+        """Snapshot of the metadata for the currently-executing prompt."""
+        return self.get_prompt_metadata_by_token(self.active_prompt_metadata_token)
 
     def send_sync(self, event, data, sid=None):
-        data = merge_prompt_metadata(self.prompt_metadata, self._prompt_metadata_lock, data)
+        data = merge_prompt_metadata(
+            self.prompt_metadata,
+            self._prompt_metadata_lock,
+            self.active_prompt_metadata_token,
+            data,
+        )
         self.loop.call_soon_threadsafe(
             self.messages.put_nowait, (event, data, sid))
 

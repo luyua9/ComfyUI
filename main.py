@@ -27,6 +27,7 @@ from utils.mime_types import init_mime_types
 import faulthandler
 import logging
 import sys
+from comfy_execution.metadata import PROMPT_METADATA_TOKEN_KEY
 from comfy_execution.progress import get_progress_state
 from comfy_execution.utils import get_executing_context
 from comfy_api import feature_flags
@@ -317,6 +318,13 @@ def prompt_worker(q, server_instance):
             for k in sensitive:
                 extra_data[k] = sensitive[k]
 
+            # Pin the metadata token registered for this exact prompt while it
+            # runs so ``send_sync`` can decorate its frames with the right
+            # ``workflow_id`` even if another submission shares the same
+            # ``prompt_id``.
+            metadata_token = extra_data.pop(PROMPT_METADATA_TOKEN_KEY, None)
+            server_instance.active_prompt_metadata_token = metadata_token
+
             asset_seeder.pause()
             try:
                 e.execute(item[2], prompt_id, extra_data, item[4])
@@ -336,7 +344,8 @@ def prompt_worker(q, server_instance):
                 # Drop the per-prompt metadata only AFTER the terminal "executing"
                 # send so the registered workflow_id is merged onto that frame.
                 # This is what eliminates the #13684 finally-clear race.
-                server_instance.unregister_prompt_metadata(prompt_id)
+                server_instance.active_prompt_metadata_token = None
+                server_instance.unregister_prompt_metadata(metadata_token)
 
             current_time = time.perf_counter()
             execution_time = current_time - execution_start_time

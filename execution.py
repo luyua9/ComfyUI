@@ -36,6 +36,7 @@ from comfy_execution.graph import (
     get_input_info,
 )
 from comfy_execution.graph_utils import GraphBuilder, is_link
+from comfy_execution.metadata import PROMPT_METADATA_TOKEN_KEY
 from comfy_execution.validation import validate_node_input
 from comfy_execution.progress import get_progress_state, reset_progress_state, add_progress_handler, WebUIProgressHandler
 from comfy_execution.utils import CurrentNodeContext
@@ -1294,25 +1295,32 @@ class PromptQueue:
         with self.mutex:
             return len(self.queue) + len(self.currently_running)
 
+    def _extract_metadata_token(self, item):
+        # Queue item shape: (number, prompt_id, prompt, extra_data, outputs, sensitive)
+        extra_data = item[3] if len(item) > 3 and isinstance(item[3], dict) else None
+        if not extra_data:
+            return None
+        return extra_data.get(PROMPT_METADATA_TOKEN_KEY)
+
     def wipe_queue(self):
         with self.mutex:
-            cancelled_ids = [item[1] for item in self.queue]
+            cancelled_tokens = [self._extract_metadata_token(item) for item in self.queue]
             self.queue = []
             self.server.queue_updated()
-        for prompt_id in cancelled_ids:
-            self.server.unregister_prompt_metadata(prompt_id)
+        for token in cancelled_tokens:
+            self.server.unregister_prompt_metadata(token)
 
     def delete_queue_item(self, function):
         with self.mutex:
             for x in range(len(self.queue)):
                 if function(self.queue[x]):
-                    cancelled_id = self.queue[x][1]
+                    cancelled_token = self._extract_metadata_token(self.queue[x])
                     if len(self.queue) == 1:
                         self.wipe_queue()
                     else:
                         self.queue.pop(x)
                         heapq.heapify(self.queue)
-                        self.server.unregister_prompt_metadata(cancelled_id)
+                        self.server.unregister_prompt_metadata(cancelled_token)
                     self.server.queue_updated()
                     return True
         return False

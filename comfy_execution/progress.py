@@ -160,10 +160,10 @@ class WebUIProgressHandler(ProgressHandler):
         self.registry = registry
 
     def _lookup_workflow_id(self, prompt_id: str) -> Optional[str]:
-        get_meta = getattr(self.server_instance, "get_prompt_metadata", None)
+        get_meta = getattr(self.server_instance, "get_active_prompt_metadata", None)
         if get_meta is None:
             return None
-        return get_meta(prompt_id).get("workflow_id")
+        return get_meta().get("workflow_id")
 
     def _send_progress_state(self, prompt_id: str, nodes: Dict[str, NodeProgressState]):
         """Send the current progress state to the client"""
